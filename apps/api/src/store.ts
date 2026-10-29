@@ -2,7 +2,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import type { Member, Role } from '@planning-poker/shared';
+import type { Card, Member, Role } from '@planning-poker/shared';
 
 export const INVITATION_LIFETIME_MS = 14 * 24 * 60 * 60 * 1000;
 export const ACCESS_LIFETIME_SECONDS = 30 * 24 * 60 * 60;
@@ -16,6 +16,14 @@ export interface StoredSession {
   created_at: string;
   expires_at: number;
   closed_at: string | null;
+}
+
+export interface StoredRound {
+  id: string;
+  session_id: string;
+  story_id: string;
+  number: number;
+  revealed_at: string | null;
 }
 
 export function openStore(path: string) {
@@ -45,6 +53,43 @@ export function openStore(path: string) {
     CREATE INDEX IF NOT EXISTS members_session ON members(session_id);
   `);
 
+  const version = (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
+  if (version > 1) {
+    db.close();
+    throw new Error('This database requires a newer version of Planning Poker.');
+  }
+  if (version === 0) {
+    db.exec('BEGIN');
+    try {
+      db.exec(`
+        CREATE TABLE rounds (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL REFERENCES sessions(id),
+          story_id TEXT NOT NULL,
+          number INTEGER NOT NULL CHECK (number > 0),
+          revealed_at TEXT,
+          UNIQUE(session_id, number)
+        );
+        CREATE TABLE votes (
+          round_id TEXT NOT NULL REFERENCES rounds(id),
+          member_id TEXT NOT NULL REFERENCES members(id),
+          card TEXT NOT NULL CHECK (card IN ('0', '1', '2', '3', '5', '8', '13', '21', '?')),
+          PRIMARY KEY(round_id, member_id)
+        );
+      `);
+      const existing = db.prepare('SELECT id FROM sessions').all() as { id: string }[];
+      for (const row of existing) {
+        db.prepare('INSERT INTO rounds (id, session_id, story_id, number) VALUES (?, ?, ?, 1)')
+          .run(randomUUID(), row.id, randomUUID());
+      }
+      db.exec('PRAGMA user_version = 1; COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      db.close();
+      throw error;
+    }
+  }
+
   function session(id: string) {
     return db.prepare('SELECT * FROM sessions WHERE id = ?').get(id) as unknown as StoredSession | undefined;
   }
@@ -64,6 +109,8 @@ export function openStore(path: string) {
     try {
       db.prepare('INSERT INTO sessions (id, title, invitation, created_at, expires_at) VALUES (?, ?, ?, ?, ?)')
         .run(id, title, newToken(), new Date(now).toISOString(), now + INVITATION_LIFETIME_MS);
+      db.prepare('INSERT INTO rounds (id, session_id, story_id, number) VALUES (?, ?, ?, 1)')
+        .run(randomUUID(), id, randomUUID());
       const access = addMember(id, nickname, 'facilitator', now);
       db.exec('COMMIT');
       return { id, ...access };
@@ -88,5 +135,29 @@ export function openStore(path: string) {
     db.prepare('UPDATE sessions SET closed_at = ? WHERE id = ? AND closed_at IS NULL')
       .run(new Date(now).toISOString(), id);
   }
-  return { create, session, invitation, addMember, member, members, nicknameExists, closeSession, close: () => db.close() };
+
+  function currentRound(sessionId: string) {
+    return db.prepare('SELECT * FROM rounds WHERE session_id = ? ORDER BY number DESC LIMIT 1')
+      .get(sessionId) as unknown as StoredRound;
+  }
+  function votes(roundId: string) {
+    return db.prepare('SELECT member_id, card FROM votes WHERE round_id = ?')
+      .all(roundId) as unknown as { member_id: string; card: Card }[];
+  }
+  function saveVote(roundId: string, memberId: string, card: Card) {
+    db.prepare(`
+      INSERT INTO votes (round_id, member_id, card) VALUES (?, ?, ?)
+      ON CONFLICT(round_id, member_id) DO UPDATE SET card = excluded.card
+    `).run(roundId, memberId, card);
+  }
+  function revealRound(roundId: string, now: number) {
+    db.prepare('UPDATE rounds SET revealed_at = ? WHERE id = ? AND revealed_at IS NULL')
+      .run(new Date(now).toISOString(), roundId);
+  }
+  function nextRound(round: StoredRound) {
+    db.prepare('INSERT INTO rounds (id, session_id, story_id, number) VALUES (?, ?, ?, ?)')
+      .run(randomUUID(), round.session_id, round.story_id, round.number + 1);
+  }
+
+  return { currentRound, votes, saveVote, revealRound, nextRound, create, session, invitation, addMember, member, members, nicknameExists, closeSession, close: () => db.close() };
 }
