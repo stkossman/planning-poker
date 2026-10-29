@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
-import type { CreateSessionInput, Invitation, SessionState } from '@planning-poker/shared';
+import type { CreateSessionInput, Invitation, RoundInput, SessionState, VoteInput } from '@planning-poker/shared';
 import { request } from './api';
+import { VotingRound } from './VotingRound';
 
 const errorMessage = (error: unknown) => error instanceof Error ? error.message : 'Something went wrong. Please try again.';
 
@@ -60,16 +61,20 @@ function Session({ id }: { id: string }) {
   const [session, setSession] = useState<SessionState>();
   const [error, setError] = useState('');
   const [copyStatus, setCopyStatus] = useState('');
-  const [closing, setClosing] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const mutationPending = useRef(false);
+  const refreshEpoch = useRef(0);
   useEffect(() => {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
     async function refresh() {
+      const epoch = refreshEpoch.current;
       try {
+        if (mutationPending.current) return;
         const next = await request<SessionState>(`/sessions/${id}`, { signal: controller.signal });
-        if (!controller.signal.aborted) { setSession(next); setError(''); }
+        if (!controller.signal.aborted && !mutationPending.current && epoch === refreshEpoch.current) { setSession(next); setError(''); }
       } catch (error) {
-        if (!controller.signal.aborted) setError(errorMessage(error));
+        if (!controller.signal.aborted && !mutationPending.current && epoch === refreshEpoch.current) setError(errorMessage(error));
       } finally {
         if (!controller.signal.aborted) timer = setTimeout(refresh, 2000);
       }
@@ -77,12 +82,23 @@ function Session({ id }: { id: string }) {
     void refresh();
     return () => { controller.abort(); clearTimeout(timer); };
   }, [id]);
-  async function closeSession() {
-    if (closing || !window.confirm('End this session? New participants will no longer be able to join.')) return;
-    setClosing(true);
-    try { setSession(await request<SessionState>(`/sessions/${id}/close`, { method: 'POST' })); }
-    catch (error) { setError(errorMessage(error)); }
-    finally { setClosing(false); }
+  async function updateSession(action: string, input?: RoundInput | VoteInput) {
+    if (mutationPending.current) return;
+    mutationPending.current = true;
+    refreshEpoch.current += 1;
+    setBusy(true);
+    setError('');
+    try {
+      setSession(await request<SessionState>(`/sessions/${id}/${action}`, {
+        method: 'POST', ...(input ? { body: JSON.stringify(input) } : {}),
+      }));
+    } catch (error) { setError(errorMessage(error)); }
+    finally { mutationPending.current = false; setBusy(false); }
+  }
+  function closeSession() {
+    if (window.confirm('End this session? New participants will no longer be able to join.')) {
+      void updateSession('close');
+    }
   }
   const invitationUrl = session?.invitationPath ? new URL(session.invitationPath, window.location.origin).href : '';
   async function copyInvitation() {
@@ -102,15 +118,8 @@ function Session({ id }: { id: string }) {
         <button type="button" onClick={copyInvitation}>Copy invitation</button></div>
       <p role="status" className="copy-status">{copyStatus}</p>
     </div> : null}
-    <section className="participants"><h2>Participants</h2><ul>
-      {session.participants.map(member => <li key={member.id}><span>{member.nickname}</span>
-        <span className="role">{member.role === 'facilitator' ? 'Facilitator' : 'Participant'}</span></li>)}
-    </ul></section>
-    <section className="deck"><h2>Standard deck</h2><ul aria-label="Standard deck">
-      {session.deck.map(card => <li key={card}>{card}</li>)}
-    </ul></section>
-    {session.self.role === 'facilitator' && !session.closedAt ? <button type="button" className="danger" onClick={closeSession} disabled={closing}>End session</button> : null}
-    <p className="note">Voting is not available in this version.</p>
+    <VotingRound session={session} busy={busy} onAction={updateSession} />
+    {session.self.role === 'facilitator' && !session.closedAt ? <button type="button" className="danger" onClick={closeSession} disabled={busy}>End session</button> : null}
     <p className="note">Access is saved in this browser for 30 days. Invitations expire after 14 days.</p>
     <a href="/">Create another session</a>
   </section>;

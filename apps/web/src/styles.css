@@ -47,3 +47,15 @@ ul { list-style: none; margin: 0; padding: 0; }
  .deck ul { gap: 8px; }
  .deck li { min-width: 42px; height: 58px; }
 }
+
+fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+legend { margin-bottom: 12px; font-weight: 550; }
+.vote-cards { display: flex; flex-wrap: wrap; gap: 10px; }
+.vote-cards button { min-width: 52px; min-height: 68px; padding: 8px; font-size: 22px; background: #fff; color: #162433; border-color: #bac6cf; }
+.vote-cards button:hover:not(:disabled) { background: #edf5f2; border-color: #176b58; }
+.vote-cards button[aria-pressed="true"] { background: #176b58; border-color: #176b58; color: #fff; }
+.vote-cards button:disabled { cursor: default; opacity: .7; }
+.vote-confirmation { margin: 16px 0; font-weight: 650; }
+.round-actions { margin-top: 24px; }
+.vote-status { display: grid; text-align: right; flex-shrink: 0; font-variant-numeric: tabular-nums; }
+.participants { margin-bottom: 32px; }
