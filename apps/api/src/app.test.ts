@@ -8,7 +8,7 @@ import type { FastifyInstance } from 'fastify';
 import { STANDARD_DECK } from '@planning-poker/shared';
 import type { SessionState } from '@planning-poker/shared';
 import { buildApp } from './app.ts';
-import { INVITATION_LIFETIME_MS } from './store.ts';
+import { hashToken, INVITATION_LIFETIME_MS } from './store.ts';
 
 const create = async (app: FastifyInstance) => {
   const response = await app.inject({ method: 'POST', url: '/api/sessions', payload: { title: 'Sprint planning', nickname: 'Alex' } });
@@ -194,4 +194,230 @@ test('expired access tokens are rejected by the server even if the cookie is rep
   const cookies = { pp_access: cookie.value };
   assert.equal((await app.inject({ url: `/api/sessions/${state.id}`, cookies })).statusCode, 401);
   assert.equal((await app.inject({ method: 'POST', url: `/api/sessions/${state.id}/close`, cookies })).statusCode, 401);
+});
+
+const roundRequest = (app: FastifyInstance, session: SessionState, token: string, action: string, body: object = {}) =>
+  app.inject({ method: 'POST', url: `/api/sessions/${session.id}/${action}`,
+    cookies: { pp_access: token }, payload: { roundId: session.round.id, ...body } });
+const readSession = async (app: FastifyInstance, id: string, token: string) => {
+  const response = await app.inject({ url: `/api/sessions/${id}`, cookies: { pp_access: token } });
+  assert.equal(response.statusCode, 200);
+  return response.json<SessionState>();
+};
+
+test('hidden votes expose only the viewer card, including in vote and join responses', async t => {
+  const app = await buildApp(); t.after(() => app.close());
+  const { state, cookie } = await create(app);
+  const joined = await joinSession(app, state.invitationPath!);
+  const participant = joined.json<SessionState>();
+  const participantToken = joined.cookies[0]!.value;
+  await roundRequest(app, state, cookie.value, 'votes', { card: '13' });
+  const submitted = await roundRequest(app, state, participantToken, 'votes', { card: '8' });
+  assert.equal(submitted.statusCode, 200);
+  assert.deepEqual(submitted.json<SessionState>().round.votes.find(v => v.memberId === state.self.id),
+    { memberId: state.self.id, hasVoted: true });
+  const host = await readSession(app, state.id, cookie.value);
+  assert.deepEqual(host.round.votes.find(v => v.memberId === participant.self.id),
+    { memberId: participant.self.id, hasVoted: true });
+  assert.equal(host.round.votes.find(v => v.memberId === state.self.id)?.card, '13');
+  const late = await joinSession(app, state.invitationPath!, 'Late');
+  assert.equal(late.statusCode, 201);
+  assert.ok(late.json<SessionState>().round.votes.every(v => v.card === undefined));
+});
+
+test('repeating a vote is idempotent; changing it replaces only that member vote', async t => {
+  const app = await buildApp(); t.after(() => app.close());
+  const { state, cookie } = await create(app);
+  for (const card of ['3', '3', '?', '0']) {
+    const result = await roundRequest(app, state, cookie.value, 'votes', { card });
+    assert.equal(result.statusCode, 200);
+    const votes = result.json<SessionState>().round.votes;
+    assert.equal(votes.filter(v => v.hasVoted).length, 1);
+    assert.equal(votes.find(v => v.memberId === state.self.id)?.card, card);
+  }
+});
+
+test('invalid cards, malformed round IDs and injected member identities are rejected', async t => {
+  const app = await buildApp(); t.after(() => app.close());
+  const { state, cookie } = await create(app);
+  for (const body of [{ card: 3 }, { card: '4' }, { card: '' }, { card: null },
+    { card: '3', memberId: 'another-member' }, { card: '3', roundId: 'bad' }, {}]) {
+    assert.equal((await roundRequest(app, state, cookie.value, 'votes', body)).statusCode, 400);
+  }
+  const current = await readSession(app, state.id, cookie.value);
+  assert.equal(current.round.votes.some(v => v.hasVoted), false);
+});
+
+test('only facilitator can reveal or advance; forged role headers do not grant permission', async t => {
+  const app = await buildApp(); t.after(() => app.close());
+  const { state, cookie } = await create(app);
+  const joined = await joinSession(app, state.invitationPath!);
+  for (const action of ['reveal', 'rounds/next']) {
+    const denied = await app.inject({
+      method: 'POST', url: `/api/sessions/${state.id}/${action}`,
+      cookies: { pp_access: joined.cookies[0]!.value },
+      headers: { 'x-role': 'facilitator' }, payload: { roundId: state.round.id },
+    });
+    assert.equal(denied.statusCode, 403);
+  }
+  const current = await readSession(app, state.id, cookie.value);
+  assert.equal(current.round.revealedAt, null);
+  assert.equal(current.round.id, state.round.id);
+  assert.equal((await roundRequest(app, state, cookie.value, 'rounds/next')).statusCode, 409);
+});
+
+test('reveal publishes identical votes to every viewer and rejects all later changes', async t => {
+  const app = await buildApp(); t.after(() => app.close());
+  const { state, cookie } = await create(app);
+  const joined = await joinSession(app, state.invitationPath!);
+  const participantToken = joined.cookies[0]!.value;
+  await roundRequest(app, state, cookie.value, 'votes', { card: '?' });
+  await roundRequest(app, state, participantToken, 'votes', { card: '21' });
+  const reveal = await roundRequest(app, state, cookie.value, 'reveal');
+  assert.equal(reveal.statusCode, 200);
+  assert.ok(reveal.json<SessionState>().round.revealedAt);
+  const host = await readSession(app, state.id, cookie.value);
+  const participant = await readSession(app, state.id, participantToken);
+  assert.deepEqual(host.round, participant.round);
+  assert.equal((await roundRequest(app, state, cookie.value, 'reveal')).json<SessionState>().round.revealedAt, host.round.revealedAt);
+  for (const token of [cookie.value, participantToken]) {
+    assert.equal((await roundRequest(app, state, token, 'votes', { card: '1' })).statusCode, 409);
+  }
+  assert.deepEqual((await readSession(app, state.id, participantToken)).round, participant.round);
+});
+
+test('next round preserves story, increments number, clears votes and rejects stale retries', async t => {
+  const app = await buildApp(); t.after(() => app.close());
+  const { state, cookie } = await create(app);
+  await roundRequest(app, state, cookie.value, 'votes', { card: '5' });
+  await roundRequest(app, state, cookie.value, 'reveal');
+  const next = await roundRequest(app, state, cookie.value, 'rounds/next');
+  assert.equal(next.statusCode, 200);
+  const current = next.json<SessionState>();
+  assert.notEqual(current.round.id, state.round.id);
+  assert.equal(current.round.storyId, state.round.storyId);
+  assert.equal(current.round.number, 2);
+  assert.equal(current.round.revealedAt, null);
+  assert.ok(current.round.votes.every(v => !v.hasVoted && v.card === undefined));
+  for (const action of ['votes', 'reveal', 'rounds/next']) {
+    const body = action === 'votes' ? { card: '8' } : {};
+    assert.equal((await roundRequest(app, state, cookie.value, action, body)).statusCode, 409);
+  }
+  assert.equal((await roundRequest(app, current, cookie.value, 'votes', { card: '8' })).statusCode, 200);
+});
+
+test('round mutations require unexpired access scoped to the same session and permitted origin', async t => {
+  let clock = Date.parse('2026-10-29T12:00:00Z');
+  const app = await buildApp({ now: () => clock }); t.after(() => app.close());
+  const first = await create(app);
+  const other = await create(app);
+  for (const action of ['votes', 'reveal', 'rounds/next']) {
+    const payload = { roundId: first.state.round.id, ...(action === 'votes' ? { card: '3' } : {}) };
+    const url = `/api/sessions/${first.state.id}/${action}`;
+    assert.equal((await app.inject({ method: 'POST', url, payload })).statusCode, 401);
+    assert.equal((await app.inject({ method: 'POST', url, payload, cookies: { pp_access: other.cookie.value } })).statusCode, 401);
+    assert.equal((await app.inject({ method: 'POST', url, payload, cookies: { pp_access: first.cookie.value },
+      headers: { origin: 'https://untrusted.example' } })).statusCode, 403);
+  }
+  clock += 30 * 24 * 60 * 60 * 1000;
+  assert.equal((await roundRequest(app, first.state, first.cookie.value, 'votes', { card: '3' })).statusCode, 401);
+  assert.equal((await roundRequest(app, first.state, first.cookie.value, 'reveal')).statusCode, 401);
+  assert.equal((await roundRequest(app, first.state, first.cookie.value, 'rounds/next')).statusCode, 401);
+});
+
+test('closed sessions reject voting, revealing and next round without changing stored round', async t => {
+  const app = await buildApp(); t.after(() => app.close());
+  const { state, cookie } = await create(app);
+  await app.inject({ method: 'POST', url: `/api/sessions/${state.id}/close`, cookies: { pp_access: cookie.value } });
+  for (const action of ['votes', 'reveal', 'rounds/next']) {
+    assert.equal((await roundRequest(app, state, cookie.value, action, action === 'votes' ? { card: '3' } : {})).statusCode, 409);
+  }
+  assert.equal((await readSession(app, state.id, cookie.value)).round.id, state.round.id);
+});
+
+test('votes and round state survive restarts; earlier round votes remain in SQLite', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'planning-poker-rounds-'));
+  const databasePath = join(directory, 'sessions.sqlite');
+  let app = await buildApp({ databasePath });
+  try {
+    const { state, cookie } = await create(app);
+    const joined = await joinSession(app, state.invitationPath!);
+    const participantToken = joined.cookies[0]!.value;
+    await roundRequest(app, state, cookie.value, 'votes', { card: '8' });
+    await roundRequest(app, state, participantToken, 'votes', { card: '5' });
+    await app.close();
+    app = await buildApp({ databasePath });
+    const host = await readSession(app, state.id, cookie.value);
+    assert.equal(host.round.id, state.round.id);
+    assert.equal(host.round.votes.find(v => v.memberId === host.self.id)?.card, '8');
+    assert.equal(host.round.votes.filter(v => v.card !== undefined).length, 1);
+    await roundRequest(app, state, cookie.value, 'reveal');
+    const revealed = (await readSession(app, state.id, participantToken)).round;
+    await app.close();
+    app = await buildApp({ databasePath });
+    assert.deepEqual((await readSession(app, state.id, participantToken)).round, revealed);
+    const next = await roundRequest(app, state, cookie.value, 'rounds/next');
+    const nextState = next.json<SessionState>();
+    await app.close();
+    app = await buildApp({ databasePath });
+    assert.deepEqual((await readSession(app, state.id, cookie.value)).round, nextState.round);
+    const database = new DatabaseSync(databasePath);
+    try {
+      assert.equal(database.prepare('SELECT count(*) AS n FROM votes WHERE round_id = ?').get(state.round.id)?.n, 2);
+      assert.equal(database.prepare('PRAGMA user_version').get()?.user_version, 1);
+    } finally { database.close(); }
+  } finally {
+    await app.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('migration upgrades a legacy database without losing existing session or management access', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'planning-poker-legacy-'));
+  const databasePath = join(directory, 'sessions.sqlite');
+  const database = new DatabaseSync(databasePath);
+  const id = '00000000-0000-4000-8000-000000000001';
+  const token = 'legacy-management-access';
+  database.exec(`
+    CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT NOT NULL, invitation TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL, expires_at INTEGER NOT NULL, closed_at TEXT);
+    CREATE TABLE members (id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
+      nickname TEXT NOT NULL COLLATE NOCASE, role TEXT NOT NULL CHECK(role IN ('facilitator','participant')),
+      token_hash TEXT NOT NULL UNIQUE, expires_at INTEGER NOT NULL, UNIQUE(session_id,nickname));
+  `);
+  database.prepare('INSERT INTO sessions VALUES (?, ?, ?, ?, ?, NULL)')
+    .run(id, 'Legacy session', 'x'.repeat(43), new Date().toISOString(), Date.now() + INVITATION_LIFETIME_MS);
+  database.prepare('INSERT INTO members VALUES (?, ?, ?, ?, ?, ?)')
+    .run('legacy-member', id, 'Alex', 'facilitator', hashToken(token), Date.now() + INVITATION_LIFETIME_MS);
+  database.close();
+  const app = await buildApp({ databasePath });
+  try {
+    const state = await readSession(app, id, token);
+    assert.equal(state.title, 'Legacy session');
+    assert.equal(state.self.role, 'facilitator');
+    assert.equal(state.round.number, 1);
+    assert.equal(state.round.votes[0]?.hasVoted, false);
+    assert.equal((await roundRequest(app, state, token, 'votes', { card: '3' })).statusCode, 200);
+  } finally {
+    await app.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('25 independently authenticated participants can vote privately and receive identical revealed results', async t => {
+  const app = await buildApp(); t.after(() => app.close());
+  const { state, cookie } = await create(app);
+  const joined = await Promise.all(Array.from({ length: 25 }, (_, i) =>
+    joinSession(app, state.invitationPath!, `Participant ${i + 1}`)));
+  assert.ok(joined.every(response => response.statusCode === 201));
+  const tokens = joined.map(response => response.cookies[0]!.value);
+  await Promise.all(tokens.map((token, i) => roundRequest(app, state, token, 'votes', { card: STANDARD_DECK[i % STANDARD_DECK.length] })));
+  for (const token of tokens) {
+    const hidden = await readSession(app, state.id, token);
+    assert.equal(hidden.round.votes.filter(v => v.hasVoted).length, 25);
+    assert.equal(hidden.round.votes.filter(v => v.card !== undefined).length, 1);
+  }
+  await roundRequest(app, state, cookie.value, 'reveal');
+  const expected = (await readSession(app, state.id, cookie.value)).round;
+  for (const token of tokens) assert.deepEqual((await readSession(app, state.id, token)).round, expected);
 });
